@@ -580,6 +580,7 @@ class Issue:
     def __init__(self, issue_id: int, session: requests.Session):
         self._issue_id = issue_id
         self._session = session
+        self._url = None
         self._characters = None
         self._cover = None
         self._community = {
@@ -702,6 +703,15 @@ class Issue:
         return self._issue_id
 
     @property
+    def url(self) -> str:
+        """Issue URL"""
+        return self._url
+
+    @url.setter
+    def url(self, value):
+        self._url = value
+
+    @property
     def details(self) -> dict:
         """Issue details
 
@@ -810,7 +820,11 @@ class Issue:
 
     def _get_data(self):
         """Get series info"""
-        url = f"https://leagueofcomicgeeks.com/comic/{self.issue_id}/{randomword(10)}"
+        if self._url:
+            slug = self._url.rstrip('/').split('/')[-1]
+        else:
+            slug = randomword(10)
+        url = f"https://leagueofcomicgeeks.com/comic/{self.issue_id}/{slug}"
         r = self._session.get(url)
         r.raise_for_status()
         soup = BeautifulSoup(r.content, features="lxml")

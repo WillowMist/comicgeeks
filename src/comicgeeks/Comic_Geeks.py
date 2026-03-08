@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Union
 
-import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 
 from comicgeeks.classes import Character, Creator, Issue, Series, Trade_Paperback
@@ -16,10 +16,21 @@ class Comic_Geeks:
     """
 
     def __init__(self, ci_session: str = None) -> None:
-        self._session = requests.Session()
+        self._session = cloudscraper.create_scraper()
         self._session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:20.0) Gecko/20100101 Firefox/20.0"
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-User": "?1",
+                "Cache-Control": "max-age=0",
             }
         )
         self._session.authenticated = False
@@ -208,18 +219,23 @@ class Comic_Geeks:
         """
         return Series(series_id, self._session)
 
-    def issue_info(self, issue_id: int) -> Union[Issue, Trade_Paperback]:
+    def issue_info(self, issue_id: int, url: str = None) -> Union[Issue, Trade_Paperback]:
         """Get issue info by id
 
         Args:
             issue_id (int): issue id
+            url (str): optional URL slug for the issue
 
         Returns:
             Issue | Trade_Paperback: Issue object
         """
         if is_trade_paperback(issue_id):
-            return Trade_Paperback(issue_id, self._session)
-        return Issue(issue_id, self._session)
+            issue = Trade_Paperback(issue_id, self._session)
+        else:
+            issue = Issue(issue_id, self._session)
+        if url:
+            issue.url = url
+        return issue
 
     def creator_info(self, creator_id: int) -> Creator:
         """Get creator info by id
