@@ -1515,7 +1515,7 @@ class Character:
         if lists:
             for creator in lists[0].findAll("li"):
                 a = creator.find("a")
-                if "people" in a["href"]:
+                if a is not None and "href" in a.attrs and "people" in a["href"]:
                     creator_id = a["href"].split("/")[2]
                     c = Creator(creator_id, self._session)
                     c.name = creator.find(class_="title").text.strip()
