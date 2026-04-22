@@ -288,9 +288,9 @@ class Series:
         ).text
         self._start_year = int(begin.strip()) if begin else 0
         self._end_year = int(end.strip()) if end and end.strip() != "Present" else 0
-        self._issues = sorted(issues, key=lambda x: float(x.number))
+        self._issues = sorted(issues, key=lambda x: float(x.number) if x.number and x.number.strip() else float('inf'))
         self._issue_count = len(issues)
-        self._trade_paperbacks = sorted(trade_paperbacks, key=lambda x: float(x.number))
+        self._trade_paperbacks = sorted(trade_paperbacks, key=lambda x: float(x.number) if x.number and x.number.strip() else float('inf'))
         self._trade_paperback_count = len(trade_paperbacks)
         self._url = header.find(class_="dropdown-item")["href"].split(
             "/submit-new-issue"
