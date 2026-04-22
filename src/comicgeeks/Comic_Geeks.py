@@ -33,9 +33,11 @@ class Comic_Geeks:
                 "Cache-Control": "max-age=0",
             }
         )
+        if ci_session:
+            self._session.cookies.set("ci_session", ci_session)
         self._session.authenticated = False
         self._session.authenticated = False
-        if self._validate_session(ci_session):
+        if ci_session and self._validate_session(ci_session):
             self._session.authenticated = True
 
     def login(self, username: str, password: str) -> bool:
