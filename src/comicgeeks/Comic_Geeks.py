@@ -1,11 +1,373 @@
+import http.client
+import logging
+import os
+import random
+import string
+import time
 from datetime import datetime
 from typing import Union
 
 import cloudscraper
+import requests
 from bs4 import BeautifulSoup
 
+http.client.MAXHEADERS = 1000
+
 from comicgeeks.classes import Character, Creator, Issue, Series, Trade_Paperback
-from comicgeeks.utils import get_series, is_trade_paperback
+from comicgeeks.utils import dump_bad_response, get_series, is_trade_paperback
+
+logger = logging.getLogger(__name__)
+
+
+def _generate_session_id():
+    """Generate a random sticky session ID for ScrapingAnt."""
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
+
+
+def _is_cloudflare_challenge(resp):
+    """Detect Cloudflare challenge responses (GIF challenge or captcha page)."""
+    content_type = resp.headers.get('Content-Type', '')
+    if content_type == 'image/gif' or len(resp.content) == 43:
+        return True
+    if resp.status_code == 403 and 'cf-chl-bypass' in resp.headers:
+        return True
+    if resp.status_code == 200 and b'challenge-platform' in resp.content[:2000]:
+        return True
+    return False
+
+
+# Upstream requests can legitimately take a while (ScrapingBee render_js,
+# ScrapingAnt headless browser). Give them a generous ceiling so a hung
+# connection becomes a retryable error instead of a truncated 200 body.
+REQUEST_TIMEOUT = int(os.getenv('COMIC_GEEKS_REQUEST_TIMEOUT', '180'))
+
+_BLOCK_PAGE_MARKERS = (
+    b'<title>restricted</title>',
+    b'just a moment',
+    b'attention required',
+    b'access denied',
+    b'cf-chl',
+    b'challenge-platform',
+)
+
+
+def _is_block_page(resp):
+    """Detect upstream block / challenge / empty responses, including HTTP 200.
+
+    ``_is_cloudflare_challenge`` only catches a narrow set of markers. LoCG's
+    Cloudflare block page comes back as ``HTTP 200`` with a
+    ``<title>Restricted</title>`` body (verified by fetching from the VPS IP),
+    which used to slip through and get parsed as a real page -- surfacing far
+    downstream as ``no header-intro``. Treat these as retryable / fallback so a
+    block page is never handed to the parser.
+    """
+    if resp.status_code in (401, 403, 429, 500, 502, 503, 504):
+        return True
+
+    content = resp.content or b''
+    head = content[:4096].lower()
+    if any(marker in head for marker in _BLOCK_PAGE_MARKERS):
+        return True
+
+    # Only apply the "suspiciously small HTML body" heuristic to HTML; a small
+    # JSON payload (e.g. an empty series search) is a legitimate response.
+    content_type = (resp.headers.get('Content-Type') or '').lower()
+    if 'text/html' in content_type and len(content) < 512:
+        return True
+
+    return False
+
+
+class ScrapingBeeSession(requests.Session):
+    """Routes HTTP requests through ScrapingBee API to bypass Cloudflare.
+
+    Supports a configurable list of fallback backends.
+    """
+
+    def __init__(self, api_key: str, fallbacks=None, log_init=True):
+        super().__init__()
+        self.scrapingbee_api_key = api_key
+        self.fallbacks = fallbacks or []
+        self.authenticated = False
+        if log_init:
+            logger.info("Scraping backend: ScrapingBee")
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+        api_params = {
+            "api_key": self.scrapingbee_api_key,
+            "url": url,
+            "render_js": "false",
+            "transparent_status_code": "true",
+        }
+
+        if self.cookies:
+            cookie_str = ";".join(f"{c.name}={c.value}" for c in self.cookies)
+            api_params["cookies"] = cookie_str
+
+        req_cookies = kwargs.pop('cookies', None)
+        if req_cookies:
+            extra = []
+            if isinstance(req_cookies, dict):
+                extra.extend(f"{k}={v}" for k, v in req_cookies.items())
+            elif isinstance(req_cookies, requests.cookies.CookieJar):
+                extra.extend(f"{c.name}={c.value}" for c in req_cookies)
+            if extra:
+                extra_str = ";".join(extra)
+                api_params["cookies"] = (
+                    api_params["cookies"] + ";" + extra_str
+                    if api_params.get("cookies")
+                    else extra_str
+                )
+
+        data = kwargs.pop('data', None)
+        headers = kwargs.get('headers', {})
+        api_url = "https://app.scrapingbee.com/api/v1"
+
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            # Use JS rendering + premium proxy on final attempt (25 credits)
+            if attempt == max_retries - 1:
+                api_params["premium_proxy"] = "true"
+                api_params["render_js"] = "true"
+                logger.debug(f"ScrapingBee using premium_proxy + render_js for {url}")
+            try:
+                if method.upper() == 'POST' and data:
+                    headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                    resp = super().request('POST', api_url, params=api_params, data=data, headers=headers, **kwargs)
+                else:
+                    resp = super().request('GET', api_url, params=api_params, headers=headers, **kwargs)
+
+                if _is_block_page(resp) or _is_cloudflare_challenge(resp):
+                    reason = f"HTTP {resp.status_code} block/challenge"
+                    if attempt < max_retries - 1:
+                        delay = 10 * (attempt + 1)
+                        logger.debug(f"ScrapingBee {reason} for {url}, retrying in {delay}s")
+                        time.sleep(delay)
+                        continue
+                    dump_bad_response(resp, url, "bee-final")
+                    last_error = resp
+                    break
+
+                resp.url = url
+                return resp
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    delay = 10 * (attempt + 1)
+                    logger.debug(f"ScrapingBee error for {url}: {e}, retrying in {delay}s")
+                    time.sleep(delay)
+
+        if self.fallbacks:
+            reason = str(last_error) if isinstance(last_error, Exception) else f"HTTP {last_error.status_code}"
+            for fb_name, fb_session in self.fallbacks:
+                logger.warning(f"ScrapingBee failed ({reason}), falling back to {fb_name}")
+                try:
+                    fb_session.cookies.clear()
+                    for cookie in self.cookies:
+                        fb_session.cookies.set(cookie.name, cookie.value)
+                    resp = fb_session.request(method, url, **kwargs)
+                    if _is_block_page(resp) or _is_cloudflare_challenge(resp):
+                        dump_bad_response(resp, url, f"{fb_name}-block")
+                        raise RuntimeError(f"{fb_name} blocked/challenge (HTTP {resp.status_code}) for {url}")
+                    resp.url = url
+                    return resp
+                except Exception as fb_e:
+                    logger.warning(f"[session:fallback] {fb_name} failed: {fb_e}")
+                    last_error = fb_e
+                    continue
+
+        if isinstance(last_error, requests.Response):
+            last_error.url = url
+            return last_error
+        raise last_error
+
+
+class CloudscraperSession(requests.Session):
+    """Direct cloudscraper session (no proxy, uses VPS IP)."""
+
+    def __init__(self, log_init=True):
+        super().__init__()
+        self._scraper = cloudscraper.create_scraper()
+        self.authenticated = False
+        if log_init:
+            logger.info("Scraping backend: cloudscraper (direct/VPS IP)")
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+        resp = self._scraper.request(method, url, **kwargs)
+        resp.url = url
+        return resp
+
+
+class ScrapingAntSession(requests.Session):
+    """Routes HTTP requests through ScrapingAnt API to bypass Cloudflare.
+
+    Uses a sticky proxy session (single exit IP) to keep cf_clearance cookies valid.
+    Supports a configurable list of fallback backends.
+    """
+
+    def __init__(self, api_key: str, fallbacks=None, proxy_session_id=None):
+        super().__init__()
+        self.scrapingant_api_key = api_key
+        self.fallbacks = fallbacks or []
+        self.proxy_session_id = proxy_session_id or _generate_session_id()
+        self.authenticated = False
+        logger.info(f"Scraping backend: ScrapingAnt (sticky session: {self.proxy_session_id})")
+
+    def request(self, method, url, **kwargs):
+        kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+        api_params = {
+            "url": url,
+            "x-api-key": self.scrapingant_api_key,
+            "transparent_status_code": "true",
+            "return_page_source": "true",
+            "proxy_session_id": self.proxy_session_id,
+        }
+
+        if self.cookies:
+            cookie_str = ";".join(f"{c.name}={c.value}" for c in self.cookies)
+            api_params["cookies"] = cookie_str
+
+        req_cookies = kwargs.pop('cookies', None)
+        if req_cookies:
+            extra = []
+            if isinstance(req_cookies, dict):
+                extra.extend(f"{k}={v}" for k, v in req_cookies.items())
+            elif isinstance(req_cookies, requests.cookies.CookieJar):
+                extra.extend(f"{c.name}={c.value}" for c in req_cookies)
+            if extra:
+                extra_str = ";".join(extra)
+                api_params["cookies"] = (
+                    api_params["cookies"] + ";" + extra_str
+                    if api_params.get("cookies")
+                    else extra_str
+                )
+
+        data = kwargs.pop('data', None)
+        headers = kwargs.get('headers', {})
+        api_url = "https://api.scrapingant.com/v2/general"
+
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                if method.upper() == 'POST' and data:
+                    headers['Ant-Content-Type'] = 'application/x-www-form-urlencoded'
+                    resp = super().request('POST', api_url, params=api_params, data=data, headers=headers, **kwargs)
+                else:
+                    resp = super().request('GET', api_url, params=api_params, headers=headers, **kwargs)
+
+                if _is_block_page(resp) or _is_cloudflare_challenge(resp):
+                    if attempt < max_retries - 1:
+                        delay = 10 * (attempt + 1)
+                        logger.debug(f"ScrapingAnt HTTP {resp.status_code} block/challenge for {url}, retrying in {delay}s (attempt {attempt+1}/{max_retries})")
+                        time.sleep(delay)
+                        continue
+                    dump_bad_response(resp, url, "ant-final")
+                    last_error = resp
+                    break
+
+                resp.url = url
+                return resp
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    delay = 10 * (attempt + 1)
+                    logger.debug(f"ScrapingAnt error for {url}: {e}, retrying in {delay}s")
+                    time.sleep(delay)
+
+        if self.fallbacks:
+            reason = str(last_error) if isinstance(last_error, Exception) else f"HTTP {last_error.status_code}"
+            for fb_name, fb_session in self.fallbacks:
+                logger.warning(f"[session:{self.proxy_session_id}] ScrapingAnt failed ({reason}), falling back to {fb_name}")
+                try:
+                    # Copy parent cookies to fallback session (clear first to avoid accumulation)
+                    fb_session.cookies.clear()
+                    for cookie in self.cookies:
+                        fb_session.cookies.set(cookie.name, cookie.value)
+                    resp = fb_session.request(method, url, **kwargs)
+                    if _is_block_page(resp) or _is_cloudflare_challenge(resp):
+                        dump_bad_response(resp, url, f"{fb_name}-block")
+                        raise RuntimeError(f"{fb_name} blocked/challenge (HTTP {resp.status_code}) for {url}")
+                    resp.url = url
+                    return resp
+                except Exception as fb_e:
+                    logger.warning(f"[session:fallback] {fb_name} failed: {fb_e}")
+                    last_error = fb_e
+                    continue
+
+            # All fallbacks failed - rotate to a new ScrapingAnt exit IP
+            old_session = self.proxy_session_id
+            self.proxy_session_id = _generate_session_id()
+            self.cookies.clear()
+            logger.info(f"[session:{self.proxy_session_id}] New sticky session (was: {old_session})")
+            # Retry with new session
+            api_params["proxy_session_id"] = self.proxy_session_id
+            if self.cookies:
+                cookie_str = ";".join(f"{c.name}={c.value}" for c in self.cookies)
+                api_params["cookies"] = cookie_str
+            try:
+                if method.upper() == 'POST' and data:
+                    headers['Ant-Content-Type'] = 'application/x-www-form-urlencoded'
+                    resp = super().request('POST', api_url, params=api_params, data=data, headers=headers, **kwargs)
+                else:
+                    resp = super().request('GET', api_url, params=api_params, headers=headers, **kwargs)
+                if _is_block_page(resp) or _is_cloudflare_challenge(resp):
+                    dump_bad_response(resp, url, "ant-newsession")
+                    raise RuntimeError(f"New session also failed for {url}")
+                resp.url = url
+                return resp
+            except Exception as new_session_e:
+                logger.error(f"[session:{self.proxy_session_id}] New session also failed for {url}: {new_session_e}")
+                last_error = new_session_e
+
+        if isinstance(last_error, requests.Response):
+            last_error.url = url
+            return last_error
+        raise last_error
+
+
+class FallbackSession(requests.Session):
+    """Chains multiple scraping backends in order.
+
+    Tries each backend sequentially until one succeeds.
+    Designed to support ScrapingAnt, cloudscraper, ScrapingBee, etc.
+    """
+
+    def __init__(self, backends):
+        """
+        Args:
+            backends: list of (name, session) tuples, e.g.
+                [("scrapingant", ScrapingAntSession(...)), ("direct", CloudscraperSession())]
+        """
+        super().__init__()
+        self.backends = backends
+        self.authenticated = False
+
+    def request(self, method, url, **kwargs):
+        last_error = None
+        for name, session in self.backends:
+            try:
+                resp = session.request(method, url, **kwargs)
+
+                if _is_block_page(resp) or _is_cloudflare_challenge(resp):
+                    dump_bad_response(resp, url, f"{name}-block")
+                    logger.debug(f"{name} returned HTTP {resp.status_code} block/challenge for {url}, trying next backend")
+                    last_error = resp
+                    continue
+
+                resp.url = url
+                return resp
+            except Exception as e:
+                logger.debug(f"{name} failed for {url}: {e}")
+                last_error = e
+
+        if isinstance(last_error, requests.Response):
+            last_error.url = url
+            return last_error
+        raise last_error
 
 
 class Comic_Geeks:
@@ -16,10 +378,24 @@ class Comic_Geeks:
     """
 
     def __init__(self, ci_session: str = None) -> None:
-        self._session = cloudscraper.create_scraper()
+        scrapingant_key = os.getenv('SCRAPINGANT_API_KEY')
+        scrapingbee_key = os.getenv('SCRAPINGBEE_API_KEY')
+
+        fallbacks = []
+        if scrapingant_key:
+            fallbacks.append(("scrapingant", ScrapingAntSession(scrapingant_key)))
+        fallbacks.append(("cloudscraper", CloudscraperSession(log_init=False)))
+
+        if scrapingbee_key:
+            self._session = ScrapingBeeSession(scrapingbee_key, fallbacks=fallbacks)
+        elif scrapingant_key:
+            self._session = ScrapingAntSession(scrapingant_key, fallbacks=fallbacks)
+        else:
+            self._session = CloudscraperSession()
+
         self._session.headers.update(
             {
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept-Encoding": "gzip, deflate",
@@ -35,10 +411,9 @@ class Comic_Geeks:
         )
         if ci_session:
             self._session.cookies.set("ci_session", ci_session)
-        self._session.authenticated = False
-        self._session.authenticated = False
-        if ci_session and self._validate_session(ci_session):
             self._session.authenticated = True
+        else:
+            self._session.authenticated = False
 
     def login(self, username: str, password: str) -> bool:
         """Login to League of Comic Geeks
@@ -67,13 +442,15 @@ class Comic_Geeks:
         """
         if ci_session is None or ci_session == "":
             return False
-        r = self._session.get(
-            "https://leagueofcomicgeeks.com/", cookies={"ci_session": ci_session}
-        )
-        r.raise_for_status()
-        if "dashboard" in r.url:
-            return True
-        self._session.cookies.clear()  # Clear invalid ci_session
+        try:
+            r = self._session.get(
+                "https://leagueofcomicgeeks.com/", cookies={"ci_session": ci_session}
+            )
+            if r.status_code == 200 and "dashboard" in r.url:
+                return True
+        except:
+            pass
+        self._session.cookies.clear()
         return False
 
     def search_series(self, query: str) -> list[Series]:

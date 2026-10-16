@@ -1,9 +1,52 @@
+import os
 import random
+import re
 import string
+import time
 from typing import Union
 
 import requests
 from bs4 import NavigableString, Tag
+
+
+# Where suspicious responses are dumped for offline inspection. The scraper runs
+# from the project root, so "logs/badpages" lands next to the other logs.
+DUMP_DIR = os.getenv("COMIC_GEEKS_DUMP_DIR", "logs/badpages")
+_DUMP_LIMIT = int(os.getenv("COMIC_GEEKS_DUMP_LIMIT", "500"))
+
+
+def dump_bad_response(resp, url, reason):
+    """Persist a suspicious response body + headers so we can see what it was.
+
+    Never raises: diagnostics must not break a scrape. Returns the path written,
+    or None if dumping was skipped (limit reached) or failed.
+    """
+    try:
+        content = getattr(resp, "content", b"") or b""
+        try:
+            existing = len(os.listdir(DUMP_DIR))
+        except OSError:
+            existing = 0
+        if existing >= _DUMP_LIMIT:
+            return None
+        os.makedirs(DUMP_DIR, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", url.rstrip("/").rsplit("/", 1)[-1])[:60]
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        base = os.path.join(DUMP_DIR, f"{stamp}-{reason}-{slug}")
+        with open(base + ".html", "wb") as fh:
+            fh.write(content)
+        headers = getattr(resp, "headers", {}) or {}
+        with open(base + ".meta.txt", "w", encoding="utf-8") as fh:
+            fh.write(f"requested_url: {url}\n")
+            fh.write(f"final_url: {getattr(resp, 'url', '')}\n")
+            fh.write(f"status: {getattr(resp, 'status_code', '?')}\n")
+            fh.write(f"bytes: {len(content)}\n")
+            fh.write("headers:\n")
+            for key, value in headers.items():
+                fh.write(f"  {key}: {value}\n")
+        return base + ".html"
+    except Exception:
+        return None
 
 
 def get_characters(

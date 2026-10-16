@@ -9,7 +9,57 @@ import requests
 from bs4 import BeautifulSoup
 
 from comicgeeks.extract import extract
-from comicgeeks.utils import get_characters, get_creators, get_series, randomword
+from comicgeeks.utils import (
+    dump_bad_response,
+    get_characters,
+    get_creators,
+    get_series,
+    randomword,
+)
+
+
+_BLOCK_MARKERS = (
+    "challenge-platform",
+    "cf-chl",
+    "just a moment",
+    "attention required",
+    "access denied",
+)
+
+
+def _missing_markup_detail(resp, soup, missing, issue_id, url):
+    """Explain a response that is missing expected markup.
+
+    Historically this raised ``Page structure changed: no <x>``, which implied the
+    site's markup had changed. In practice (Oct 2026 "header-intro" incident) the
+    cause was an intermittent blocked / challenge / truncated response from the
+    scraping backend. Report the evidence needed to tell the two apart instead of
+    blaming the site.
+
+    Side effect: dumps the full body + headers via ``dump_bad_response`` so the
+    exact response can be inspected offline.
+    """
+    content = getattr(resp, "content", b"") or b""
+    head = content[:4096].decode("utf-8", "replace")
+    title = ""
+    if soup is not None and soup.title is not None:
+        title = soup.title.get_text(strip=True)
+
+    markers = [m for m in _BLOCK_MARKERS if m in head.lower()]
+    if "<title>restricted</title>" in head.lower():
+        markers.append("restricted")
+
+    dump_path = dump_bad_response(resp, url, f"no-{missing}")
+
+    snippet = head[:300].replace("\n", " ").replace("\r", " ")
+    return (
+        f"Required markup missing: no {missing} for issue {issue_id} ({url}) "
+        f":: HTTP {getattr(resp, 'status_code', '?')} len={len(content)} "
+        f"title={title!r} block_markers={markers or 'none'} "
+        f"dump={dump_path or 'skipped'} "
+        f"head={snippet!r} "
+        f"(this is a blocked/challenge/truncated response, NOT a markup change)"
+    )
 
 
 class Issue:
@@ -286,8 +336,8 @@ class Series:
         self._description = BeautifulSoup(
             r["series"]["description"], features="lxml"
         ).text
-        self._start_year = int(begin.strip()) if begin else 0
-        self._end_year = int(end.strip()) if end and end.strip() != "Present" else 0
+        self._start_year = int(begin.strip()) if begin and begin.strip().isdigit() else 0
+        self._end_year = int(end.strip()) if end and end.strip() != "Present" and end.strip().isdigit() else 0
         self._issues = sorted(issues, key=lambda x: float(x.number) if x.number and x.number.strip() else float('inf'))
         self._issue_count = len(issues)
         self._trade_paperbacks = sorted(trade_paperbacks, key=lambda x: float(x.number) if x.number and x.number.strip() else float('inf'))
@@ -828,33 +878,47 @@ class Issue:
         r = self._session.get(url)
         r.raise_for_status()
         soup = BeautifulSoup(r.content, features="lxml")
+
+        header_intro = soup.find(class_="header-intro")
+        if header_intro is None:
+            raise RuntimeError(_missing_markup_detail(r, soup, "header-intro", self.issue_id, url))
+
+        comic = soup.find(id="comic-details")
+        if comic is None:
+            raise RuntimeError(_missing_markup_detail(r, soup, "comic-details", self.issue_id, url))
+
+        summary = comic.find(id="summary")
+        if summary is None:
+            raise RuntimeError(_missing_markup_detail(r, soup, "summary", self.issue_id, url))
+
         year, month, day = list(
             map(
                 int,
-                soup.find(class_="header-intro")
+                header_intro
                 .find_all("a")[1]["href"]
                 .split("/")[3::],
             )
         )
-        comic = soup.find(id="comic-details")
-        summary = comic.find(id="summary")
-        details = summary.find_all(class_="row")[-1]
+        rows = summary.find_all(class_="row")
+        details = rows[-1] if rows else None
         d = {}
-        for detail in details.find_all(class_="details-addtl-block"):
-            d[detail.find(class_="name").text.strip().lower().replace(" ", "_")] = (
-                detail.find(class_="value").text.strip().lower()
-            )
-        info = summary.find_all(class_="col")[-1].text.split("·")
-        price = float(info[-1].strip()[1::]) if "$" in info[-1] else "Unknown"
-        d["format"] = info[0].strip().lower()
-        d["page_count"] = info[1].strip()
+        if details:
+            for detail in details.find_all(class_="details-addtl-block"):
+                d[detail.find(class_="name").text.strip().lower().replace(" ", "_")] = (
+                    detail.find(class_="value").text.strip().lower()
+                )
+        cols = summary.find_all(class_="col")
+        info = cols[-1].text.split("\u00b7") if cols else []
+        d["format"] = info[0].strip().lower() if len(info) > 0 else "Unknown"
+        d["page_count"] = info[1].strip() if len(info) > 1 else "Unknown"
+        price = float(info[-1].strip()[1::]) if len(info) > 1 and "$" in info[-1] else "Unknown"
 
         stories = comic.find(id="stories")
-        creators = stories.find(id=re.compile(r"^creators"))
+        creators = stories.find(id=re.compile(r"^creators")) if stories else None
         person_credits = []
         person_credits += get_creators(creators, Creator, self._session)
 
-        cover_artists = stories.find(id="cover-artists")
+        cover_artists = stories.find(id="cover-artists") if stories else None
         person_credits += get_creators(cover_artists, Creator, self._session)
 
         credits_production = stories.find(id="credits-production")
@@ -865,12 +929,13 @@ class Issue:
 
         covers = []
         cover = comic.find(class_="cover-art")
-        covers.append(
-            {
-                "name": cover.find("img")["alt"],
-                "image": cover.find("img")["src"],
-            }
-        )
+        if cover:
+            covers.append(
+                {
+                    "name": cover.find("img")["alt"],
+                    "image": cover.find("img")["src"],
+                }
+            )
         variant_covers = comic.find(class_="variant-cover-list")
         if variant_covers:
             for variant in variant_covers.find_all(class_="text-center"):
@@ -884,26 +949,29 @@ class Issue:
                     }
                 )
         pagination = comic.find(class_="series-pagination")
-        series_pagination = {
-            "prev": Issue(
-                pagination.find(class_="prev")["href"].split("/")[2],
-                self._session,
-            )
-            if pagination.find(class_="prev")["href"] != "#"
-            else None,
-            "series": Series(
-                pagination.find(class_="series")["href"].split("/")[3],
-                self._session,
-            )
-            if pagination.find(class_="series")["href"] != "#"
-            else None,
-            "next": Issue(
-                pagination.find(class_="next")["href"].split("/")[2],
-                self._session,
-            )
-            if pagination.find(class_="next")["href"] != "#"
-            else None,
-        }
+        if pagination:
+            series_pagination = {
+                "prev": Issue(
+                    pagination.find(class_="prev")["href"].split("/")[2],
+                    self._session,
+                )
+                if pagination.find(class_="prev") and pagination.find(class_="prev")["href"] != "#"
+                else None,
+                "series": Series(
+                    pagination.find(class_="series")["href"].split("/")[3],
+                    self._session,
+                )
+                if pagination.find(class_="series") and pagination.find(class_="series")["href"] != "#"
+                else None,
+                "next": Issue(
+                    pagination.find(class_="next")["href"].split("/")[2],
+                    self._session,
+                )
+                if pagination.find(class_="next") and pagination.find(class_="next")["href"] != "#"
+                else None,
+            }
+        else:
+            series_pagination = {"prev": None, "series": None, "next": None}
         counters = comic.findAll("span", class_="ml-1")
         counters_data = {}
         for counter in counters:
@@ -916,12 +984,13 @@ class Issue:
         if counters_data["rating"] is not None:
             counters_data["rating"] = counters_data["rating"].text.strip()
 
-        title = soup.find("h1").text.strip()
+        h1 = soup.find("h1")
+        title = h1.text.strip() if h1 else ""
         name, number, volume = extract(title)
         if type(self).__name__ == "Trade_Paperback":
             number = re.findall(r"\d+", title)[0]
 
-        description: BeautifulSoup = comic.find(class_="listing-description")
+        description = comic.find(class_="listing-description")
         if comic.find(class_="story-title"):
             name: str = comic.find(class_="story-title").text.strip()
         else:
@@ -934,11 +1003,11 @@ class Issue:
         self._number = str(number) if number else ""
         self._publisher = soup.find(class_="header-intro").find("a").text.strip()
         self._store_date = int(datetime.datetime(year, month, day).timestamp())
-        self._description = description.text.strip()
+        self._description = description.text.strip() if description else ""
         self._details = d
         self._person_credits = person_credits
         self._characters = characters_credits
-        self._cover = covers[0]
+        self._cover = covers[0] if covers else None
         self._variant_covers = covers[1:]
         self._series_pagination = series_pagination
         self._community["pull"] = (
